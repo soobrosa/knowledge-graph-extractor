@@ -6,11 +6,16 @@ on the searchbox scheduler but implemented entirely with asyncio (no subprocess)
 States:
   queued   - foreground, waiting for the slot (fresh submit or explicit resume)
   running  - on the slot now
-  paused   - preemptible idle pool; auto-backfill may resume it. A preempted
-             foreground job carries preempted=True so it outranks bulk paused.
-  held     - USER-paused; sticky, NOT auto-backfilled. Explicit resume only.
+  pausing  - running but a pause was requested; yields at the next file/round edge
+  paused   - preemptible idle pool; auto-backfill may resume it
+  held     - USER-paused; sticky, NOT auto-backfilled. Explicit resume only
   done     - finished all work
   failed   - errored out
+
+A single meta field `pause_kind` ("user"|"preempt"), set when a pause is requested
+and read once at finalize, decides held vs paused. No separate intent dict.
+Backfill priority is derived from real progress (started jobs resume first), not
+from a flag that has to be maintained across preempt cycles.
 
 Everything is persisted to data/jobs/<id>/ so the list + jsonl reload + resume
 survive restarts and container rebuilds (mount data/ as a volume).
@@ -35,6 +40,7 @@ _current = {"job_id": None}             # the running job id
 _cond = asyncio.Condition()             # guards _jobs/_queue/_current + wakes worker
 _subscribers: dict[str, list] = {}      # job_id -> list[asyncio.Queue] (live SSE listeners)
 _pause_flags: dict[str, bool] = {}      # job_id -> cooperative pause request
+# pause intent lives in each job's meta as pause_kind ("user"|"preempt"); no side dict.
 
 
 # ---------- persistence ----------
@@ -81,7 +87,6 @@ def public_meta(m: dict) -> dict:
         "dedup_field": m.get("dedup_field", "triple"),
         "dedup_threshold": m.get("dedup_threshold", 0.90),
         "prompt": m.get("prompt", ""),
-        "preempted": bool(m.get("preempted")),
         "submitted": m.get("submitted"),
         "finished": m.get("finished"),
         "error": m.get("error"),
@@ -122,10 +127,10 @@ def reconcile_on_startup():
         m["job_id"] = p.name
         st = m.get("status")
         if st in ("running", "queued", "pausing"):
-            # interrupted by a deploy/restart -> resumable, and prioritized for
-            # auto-backfill (preempted tier) so it resumes ahead of bulk paused jobs.
+            # interrupted by a deploy/restart -> resumable via auto-backfill.
+            # Started jobs naturally sort ahead of untouched ones (see _paused_pool).
             m["status"] = "paused"
-            m["preempted"] = True
+            m.pop("pause_kind", None)
         # 'held'/'paused'/'done'/'failed' keep their state
         _jobs[p.name] = m
         save_meta(p.name)
@@ -138,10 +143,16 @@ def _next_foreground() -> Optional[str]:
             return j
     return None
 
+def _has_progress(m: dict) -> bool:
+    """A job that already produced facts or finished files is worth resuming first."""
+    return (m.get("files_done") or 0) > 0 or (m.get("total_facts") or 0) > 0
+
 def _paused_pool() -> list:
-    """Backfill candidates in resume priority: preempted foreground first, then oldest paused."""
+    """Backfill candidates in resume priority: jobs with progress first (finish what
+    we started), then oldest submitted. Priority is derived from real state, so it
+    stays correct across any number of preempt/resume cycles."""
     cands = [m for m in _jobs.values() if m.get("status") == "paused"]
-    cands.sort(key=lambda m: (0 if m.get("preempted") else 1, m.get("submitted") or 0))
+    cands.sort(key=lambda m: (0 if _has_progress(m) else 1, m.get("submitted") or 0))
     return [m["job_id"] for m in cands]
 
 def _select_next():
@@ -156,13 +167,14 @@ def _select_next():
             m = _jobs.get(cand, {})
             if m.get("status") != "paused":
                 continue
-            m["status"] = "queued"; m["preempted"] = False
+            m["status"] = "queued"; m.pop("pause_kind", None)
             _jobs[cand] = m; save_meta(cand)
             return cand, True
     return None, False
 
 def _preempt_running():
-    """Flag the running job to pause so the slot frees for fresh foreground work."""
+    """Flag the running job to pause so the slot frees for fresh foreground work.
+    A system preempt is backfillable -> pause_kind='preempt'."""
     jid = _current["job_id"]
     if not jid:
         return
@@ -174,8 +186,7 @@ def _preempt_running():
         return
     _pause_flags[jid] = True
     cur["status"] = "pausing"
-    if not is_auto:
-        cur["preempted"] = True
+    cur["pause_kind"] = "preempt"
     save_meta(jid)
 
 
@@ -190,7 +201,8 @@ async def create_job(meta: dict, source_bytes: bytes, source_filename: str) -> s
     jsonl_path(job_id).write_text("")
     meta.update({"job_id": job_id, "status": "queued", "submitted": time.time(),
                  "files_done": 0, "total_facts": 0, "unique_facts": 0,
-                 "duplicate_facts": 0, "finished": None, "auto": False})
+                 "duplicate_facts": 0, "finished": None, "auto": False,
+                 "pause_kind": None})
     async with _cond:
         _jobs[job_id] = meta
         _queue.append(job_id)
@@ -200,20 +212,21 @@ async def create_job(meta: dict, source_bytes: bytes, source_filename: str) -> s
     return job_id
 
 async def pause_job(job_id: str) -> dict:
-    """User pause: sticky 'held', not auto-backfilled."""
+    """User pause: sticky 'held', not auto-backfilled. pause_kind='user' is read
+    once at finalize to decide held vs paused."""
     async with _cond:
         m = _jobs.get(job_id) or load_meta(job_id)
         if not m:
             return {"error": "no such job"}
         if m.get("status") in ("done", "failed"):
             return public_meta(m)
+        m["pause_kind"] = "user"
         running = _current["job_id"] == job_id
-        if running:
+        if running or m.get("status") == "pausing":
             _pause_flags[job_id] = True
             m["status"] = "pausing"
         else:
             m["status"] = "held"
-        m["preempted"] = False
         if job_id in _queue:
             _queue.remove(job_id)
         _jobs[job_id] = m; save_meta(job_id)
@@ -221,15 +234,25 @@ async def pause_job(job_id: str) -> dict:
     return public_meta(m)
 
 async def resume_job(job_id: str) -> dict:
-    """Re-enqueue a held/paused job as foreground (preempts running)."""
+    """Re-enqueue a held/paused job as foreground (preempts running).
+    Also valid while the job is still 'pausing' (yield not yet reached): we just
+    clear the pause request and let it keep running, so a quick pause->resume is a
+    no-op instead of getting stuck in held."""
     async with _cond:
         m = _jobs.get(job_id) or load_meta(job_id)
         if not m:
             return {"error": "no such job"}
-        if m.get("status") in ("running", "queued", "pausing"):
+        if m.get("status") in ("running", "queued"):
+            return public_meta(m)
+        # Resume during the pause window: cancel the pending pause in place.
+        if m.get("status") == "pausing" and _current["job_id"] == job_id:
+            _pause_flags.pop(job_id, None)
+            m["status"] = "running"; m.pop("pause_kind", None)
+            _jobs[job_id] = m; save_meta(job_id)
+            _cond.notify_all()
             return public_meta(m)
         m["job_id"] = job_id
-        m["status"] = "queued"; m["preempted"] = False
+        m["status"] = "queued"; m.pop("pause_kind", None)
         _jobs[job_id] = m
         if job_id not in _queue:
             _queue.append(job_id)
@@ -254,7 +277,6 @@ async def delete_job(job_id: str) -> dict:
     return {"ok": True}
 
 _jobs_pending_delete: set = set()
-_user_held: dict = {}     # job_id -> True when the pending pause is a sticky USER hold
 
 def list_jobs() -> list:
     out = [public_meta(m) for m in _jobs.values()]

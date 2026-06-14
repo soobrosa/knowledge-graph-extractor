@@ -639,6 +639,7 @@ async def _worker():
                 continue
             J._jobs[job_id]["status"] = "running"
             J._jobs[job_id]["auto"] = backfill
+            J._jobs[job_id]["pause_kind"] = None
             J._current["job_id"] = job_id
             J._pause_flags.pop(job_id, None)
             J.save_meta(job_id)
@@ -653,13 +654,14 @@ async def _worker():
             J._current["job_id"] = None
             m = J._jobs.get(job_id, {})
             # If run_job returned while a pause/preempt was pending (or status not terminal),
-            # finalize: user pause -> sticky 'held', system preempt -> backfillable 'paused'.
+            # finalize from the single source of truth, pause_kind:
+            #   'user'    -> sticky 'held' (no auto-backfill)
+            #   'preempt' -> backfillable 'paused'
             pause_pending = J._pause_flags.pop(job_id, False)
             if m.get("status") not in ("done", "failed"):
                 if m.get("status") == "pausing" or pause_pending:
-                    m["status"] = "held" if J._user_held.get(job_id) else "paused"
+                    m["status"] = "held" if m.get("pause_kind") == "user" else "paused"
                     J.save_meta(job_id)
-            J._user_held.pop(job_id, None)
             # purge a job deleted while running
             if job_id in J._jobs_pending_delete:
                 J._jobs.pop(job_id, None)
@@ -758,7 +760,6 @@ async def api_job_jsonl(job_id: str):
 
 @app.post("/api/jobs/{job_id}/pause")
 async def api_pause_job(job_id: str):
-    J._user_held[job_id] = True
     return await J.pause_job(job_id)
 
 
