@@ -143,11 +143,14 @@ VIRTUAL_ENV=$PWD/.venv-mlx uv pip install mlx-lm
 
 ### MLX caveats
 
-- **Context auto-cap.** Stock `mlx_lm.server` runs an **fp16 KV cache** (no `--kv-bits` flag -
-  upstream [ml-explore/mlx-lm#1043](https://github.com/ml-explore/mlx-lm/issues/1043)). fp16 KV
-  OOMs at ~78-92K actual tokens on 36 GB, so the script caps context to `MLX_CTX_CAP` (75K). If
-  your build has `--kv-bits` ([mlx-lm#1353](https://github.com/ml-explore/mlx-lm/pull/1353)), the
-  script auto-enables 4-bit KV and raises the cap toward ~85K.
+- **Context auto-cap.** Stock `mlx_lm.server` runs an **fp16 KV cache** with no KV-quantization
+  flag (see upstream [ml-explore/mlx-lm#1043](https://github.com/ml-explore/mlx-lm/issues/1043)).
+  As of mlx-lm 0.31.3 (latest release) there is still **no `--kv-bits` on `mlx_lm.server`**, so
+  this is the path everyone gets today: fp16 KV OOMs at ~78-92K actual tokens on 36 GB, and the
+  script caps context to `MLX_CTX_CAP` (75K) accordingly. The script is forward-looking - it
+  auto-detects a `--kv-bits` flag and, when present, switches to 4-bit KV and raises the cap
+  toward ~85K. That flag isn't in any released mlx-lm yet; I'm working on landing it upstream, and
+  until it ships the fp16/75K path is the one in use.
 - **`MODEL_NAME` is pinned to the model path.** `mlx_lm.server` resolves the request's `model`
   field against the loaded model and otherwise tries to fetch it from HuggingFace (a request for
   the friendly label `qwen3.6` -> 404). llama.cpp ignores the label; MLX needs the match, so the
