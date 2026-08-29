@@ -5,24 +5,30 @@
 #   FastAPI app      (.venv, app.py)              ->  :3000  (web UI + API)
 #
 # The jina-embeddings-v5-text-nano dedup embedder runs inside the app process on CPU.
-# See docs/MAC.md for the full setup. This script only LAUNCHES; install steps live there.
+# This script only LAUNCHES. Run scripts/mac-setup.sh once first (venv, deps, model);
+# docs/MAC.md has the full reference.
 #
 # BACKEND selects the :8080 server: 'llamacpp' (default, GGUF via llama.cpp) or 'mlx' (mlx-lm,
 # Apple-native, ~6x faster prefill). mlx uses .venv-mlx + models/mlx/... and auto-caps context to
 # MLX_CTX_CAP (fp16-KV OOM headroom). See docs/MAC.md.
 #
-# It honours the docker-compose llama.cpp flags (ctx-size, draft-mtp spec decode, cache-reuse),
-# just with Mac-appropriate values:
+# llama.cpp flags below mirror the tuned upstream CUDA config (ctx-size, draft-mtp spec decode,
+# cache-reuse) with Mac-appropriate values:
 #   - SPEC_ARGS defaults to '--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.1'
 #     (MTP speculative decoding; needs llama.cpp >= build 9430). Set SPEC_ARGS= to disable if your
 #     build lacks draft-mtp support.
-#   - --flash-attn on   (the CUDA compose passes `1`; this build wants on|off|auto).
+#   - --flash-attn on   (upstream's CUDA compose passes `1`; this build wants on|off|auto).
 #   - -ngl 999 (unified memory: all layers on Metal; no L4 spill tradeoff).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-set -a; [ -f .env ] && . ./.env; set +a
+set -a
+if [ -f .env ]; then
+  # shellcheck disable=SC1091  # .env is user-created, not in the repo
+  . ./.env
+fi
+set +a
 
 JINA_API_KEY="${JINA_API_KEY:-}"
 if [ -z "$JINA_API_KEY" ] || [ "$JINA_API_KEY" = "jina_xxxx" ]; then
@@ -67,7 +73,11 @@ if [ "$BACKEND" = "mlx" ]; then
   # the loaded path, so pin the app's MODEL_NAME to it. (llama.cpp keeps the friendly default.)
   export MODEL_NAME="${MODEL_NAME:-$MLX_MODEL}"
   # Use quantized KV only if this mlx_lm.server build supports it; raise the cap accordingly.
-  if [ -n "$MLX_KV_BITS" ] && "$ROOT/.venv-mlx/bin/mlx_lm.server" --help 2>/dev/null | grep -q -- '--kv-bits'; then
+  # Capture the help text rather than piping into `grep -q`: grep exits at the first match,
+  # mlx_lm.server then dies of SIGPIPE, and `set -o pipefail` reports the whole pipeline as
+  # failed - which silently downgraded a --kv-bits-capable build to fp16 KV and the low cap.
+  MLX_HELP="$("$ROOT/.venv-mlx/bin/mlx_lm.server" --help 2>/dev/null || true)"
+  if [ -n "$MLX_KV_BITS" ] && [ "${MLX_HELP#*--kv-bits}" != "$MLX_HELP" ]; then
     MLX_KV_ARGS=(--kv-bits "$MLX_KV_BITS" --kv-group-size "$MLX_KV_GROUP_SIZE")
     MLX_CTX_CAP="${MLX_CTX_CAP:-85000}"
     echo "NOTE: BACKEND=mlx using ${MLX_KV_BITS}-bit KV (group $MLX_KV_GROUP_SIZE); ctx cap $MLX_CTX_CAP"
