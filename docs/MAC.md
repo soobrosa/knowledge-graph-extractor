@@ -1,14 +1,14 @@
 # Run on Apple Silicon (Mac, Metal)
 
 This is the Mac-only fork's full reference. The extractor runs natively on an Apple Silicon Mac with
-**no Docker and no NVIDIA GPU**. Homebrew's `llama.cpp` `llama-server` serves the model on **Metal**,
-and the FastAPI app + the `jina-embeddings-v5-text-nano` dedup embedder run in a local `uv`
-virtualenv. No application logic changes are needed: the model is decoupled behind the
-OpenAI-compatible `LLAMA_URL`, so the only Mac-specific concerns are which GGUF to use, the
-`llama-server` flags, and installing the deps upstream's Docker image bundles.
+**no Docker and no NVIDIA GPU**. The default stack serves **Qwen3.8-27B** with
+[mlx-dspark](https://github.com/ARahim3/mlx-dspark) - DeepSeek's DSpark and z-lab's DFlash
+speculative decoding, native on MLX - and the FastAPI app + the `jina-embeddings-v5-text-nano`
+dedup embedder run in a local `uv` virtualenv. No application logic changes are needed: the model
+is decoupled behind the OpenAI-compatible `LLAMA_URL`, so backends are swappable without touching
+the app.
 
-Tested on an **M3 Pro / 36 GB**, macOS, `llama.cpp` build 9430 (Homebrew). At least **32 GB** of
-unified memory is recommended - the Q3_K_XL model wires ~17 GB.
+Tested on an **M3 Pro / 36 GB**, macOS. At least **32 GB** of unified memory is recommended.
 
 ## What's different from upstream (NVIDIA / Docker)
 
@@ -18,10 +18,10 @@ records what the Mac path does instead, and why.
 
 | Area | Upstream (NVIDIA / Docker) | This fork (Apple Silicon) | Why |
 | --- | --- | --- | --- |
-| Serving | `llama.cpp:server-cuda` container | Homebrew `llama-server` (Metal) | No CUDA / `nvidia-container-toolkit` on macOS. |
-| GPU offload | implicit (CUDA) | `-ngl 999` (`NGL` env) | Unified memory: put all layers on Metal. |
-| Flash attention | `--flash-attn 1` | `--flash-attn on` | This build's flag takes `on\|off\|auto`, not `1`. |
-| Speculative decode | `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.1` | Same (`SPEC_ARGS`) | MTP works on `llama.cpp` >= 9430. Leave `SPEC_ARGS` empty to disable. |
+| Serving | `llama.cpp:server-cuda` container | `mlx-dspark serve` (Metal), `llama-server` or `mlx_lm.server` as alternatives | No CUDA / `nvidia-container-toolkit` on macOS. |
+| Model | Qwen3.6-35B-A3B (MoE, GGUF) | Qwen3.8-27B (dense, MLX 4-bit) | Dense model that mlx-dspark's drafters accelerate hard. |
+| Speculative decode | draft-MTP (llama.cpp) / none (mlx-lm) | DSpark + DFlash2 drafters (`--mode auto`) | Lossless: the target verifies every drafted token. |
+| GPU offload | implicit (CUDA) | all layers on Metal | Unified memory; `-ngl 999` on the llama.cpp path. |
 | App + embedder | Docker container | `python app.py` in a `uv` venv; embedder on CPU | No GPU passthrough into Docker on macOS; CPU keeps Metal free for the LLM. |
 | torch | CPU wheel baked into the image | `requirements.txt` into `.venv` (MPS/CPU build) | Installed locally; no image to build. |
 | Setup | `scripts/setup.sh` (GCP L4) | `scripts/mac-setup.sh` | Machine checks, venv, deps, model download. |
@@ -29,14 +29,13 @@ records what the Mac path does instead, and why.
 ## Prerequisites
 
 ```bash
-brew install llama.cpp          # Metal build of llama-server
 curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (Python env)
-uv --version
 ```
 
 You also need a free **Jina API key** (https://jina.ai/api-key, only used for URL inputs) and,
 recommended, a free **Hugging Face read token** (https://huggingface.co/settings/tokens) for a
-fast, stable model download.
+fast, stable model download. `mlx-dspark` is installed by setup if missing; install it yourself
+with `uv tool install mlx-dspark`.
 
 ## Setup (scripted)
 
@@ -44,15 +43,16 @@ fast, stable model download.
 bash scripts/mac-setup.sh
 ```
 
-One idempotent pass over everything in the manual section below: verifies arm64 and unified memory,
-checks `llama-server` and `uv`, warns if the llama.cpp build predates `draft-mtp`, creates `.venv`
-from `requirements.txt`, seeds `.env` from `.env.example`, and downloads the GGUF (resumable).
-Re-run it after a failure and it resumes rather than redoing.
+One idempotent pass: verifies arm64 and unified memory, checks the tools the backend selected in
+`.env` needs, creates `.venv` from `requirements.txt`, seeds `.env` from `.env.example`, installs
+`mlx-dspark` if it's missing, and pulls the model into the HF cache (resumable). Re-run it after a
+failure and it resumes rather than redoing.
 
 ```bash
 HF_TOKEN=hf_your_token bash scripts/mac-setup.sh   # avoids the anonymous rate limit
-bash scripts/mac-setup.sh --skip-model             # everything except the 17 GB download
-bash scripts/mac-setup.sh --mlx                    # also provision the MLX backend
+bash scripts/mac-setup.sh --skip-model             # everything except the model download
+bash scripts/mac-setup.sh --dspark                 # force mlx-dspark into project .venv-dspark
+bash scripts/mac-setup.sh --mlx                    # also provision the legacy mlx-lm backend
 ```
 
 Then put a real key in `.env` (`JINA_API_KEY=...`) - `mac-run.sh` refuses to start without one -
@@ -69,28 +69,25 @@ Equivalent to the script, if you'd rather do it by hand.
 ```bash
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements.txt
+uv tool install mlx-dspark        # the default inference server (installs mlx >= 0.32)
 ```
 
-### 2. Download the model (~17 GB)
+### 2. Download the model (Qwen3.8-27B-4bit, ~16 GB)
+
+mlx-dspark takes an HF repo id or a local path. Pre-pull the target so the first serve isn't a
+download; the matched drafter (for Qwen3.8-27B: `incoai/Qwen3.8-27B-DFlash2`, a few GB) still
+fetches on first serve:
 
 ```bash
-mkdir -p models
-# MTP GGUF (recommended - enables draft-mtp speculative decoding with llama.cpp >= 9430)
 HF_TOKEN=hf_your_token \
-.venv/bin/python -c "from huggingface_hub import hf_hub_download; \
-hf_hub_download('unsloth/Qwen3.6-35B-A3B-MTP-GGUF','Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf',local_dir='models')"
+.venv/bin/python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('mlx-community/Qwen3.8-27B-4bit')"
 ```
 
-The `HF_TOKEN=` prefix is optional but avoids the unauthenticated rate limit. If your `llama.cpp`
-is older than build 9430 (check `llama-server --help` for `draft-mtp`), use the **non-MTP** GGUF
-(`unsloth/Qwen3.6-35B-A3B-GGUF`) instead and leave `SPEC_ARGS` empty.
-
-A model living elsewhere on disk works too - symlink it in and both scripts find it:
-
-```bash
-ln -s /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf models/
-echo 'MODEL_FILE=Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf' >> .env
-```
+Peak RAM: **~18 GB** (4-bit) / ~29 GB (8-bit - needs 48 GB+, but buys the project's best measured
+spec-decode ratios: 3.63x mean with the same DFlash2 drafter). KV cache costs ~0.086 GB per 1k
+tokens fp16. Note Qwen3.8-27B is a **hybrid linear-attention** target (only 16 of 64 layers hold a
+KV cache), so `DSPARK_KV_BITS` must stay `0` for it - mlx-dspark rejects `--kv-bits` for hybrids.
 
 ### 3. Set your key
 
@@ -99,12 +96,15 @@ cp .env.example .env
 sed -i '' 's/^JINA_API_KEY=.*/JINA_API_KEY=jina_your_real_key/' .env
 ```
 
-Mac defaults are baked into `scripts/mac-run.sh`; override any in `.env`:
+Defaults are baked into `scripts/mac-run.sh`; override any in `.env`:
 
 ```bash
-MODEL_FILE=Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
-CTX_SIZE=16384            # raise if you have headroom
-SPEC_ARGS='--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.1'
+BACKEND=dspark
+DSPARK_MODEL=mlx-community/Qwen3.8-27B-4bit
+DSPARK_MODE=auto                  # auto|dspark|dflash|lookup|baseline
+DSPARK_KV_BITS=0                  # 4/8 only for pure-attention targets; hybrids reject it
+DSPARK_CTX=32768
+ENABLE_THINKING=1                 # default off
 LLAMA_URL=http://127.0.0.1:8080
 JOBS_DIR=./data/jobs
 ```
@@ -117,41 +117,71 @@ Both scripts source `.env` before applying their defaults, so anything pinned th
 bash scripts/mac-run.sh
 ```
 
-Starts `llama-server` (Metal) on `:8080`, waits for it to load, then starts the app on `:3000`.
+Starts `mlx-dspark serve` on `:8080`, waits for it to load (first run downloads the drafter and
+calibrates this Mac's draft cap, ~5 s, cached), then starts the app on `:3000`.
 Open **http://localhost:3000/**.
 
-Stop the app with `Ctrl+C`; stop the model with `pkill -f llama-server`.
+Stop the app with `Ctrl+C`; stop the model with `pkill -f mlx-dspark`.
+
+### What mlx-dspark buys
+
+- **Lossless speculation.** The target verifies every drafted token, so output is identical to
+  plain decoding - every mode, every cap. Only the speed changes.
+- **No tuning needed.** `--mode auto` resolves the measured-best drafter for the target (for
+  Qwen3.8-27B: the [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) head; the DSpark
+  alternative is `DimInfer/Qwen3.8-27B-Dspark-v1` at 4-bit, `RadixArk/Qwen3.8-27B-DSpark` at
+  8-bit). The draft cap is calibrated against *your* machine, not the M4 Pro the project's tables
+  were measured on.
+- **Prefill help, too.** CPU co-prefill (~1.3-1.4x on wide prefills) is on by default; prefix
+  caching reuses document chunks across extraction rounds. `--cpu-split 0` disables the former if
+  it misbehaves on your Mac.
+- **Thinking is off** (`--no-thinking`) by default: extraction wants facts, not reasoning. Turn
+  `ENABLE_THINKING=1` on in `.env` if you want the model to reason before answering.
+
+Measured decode on Qwen3.8-27B (mlx-dspark's tables, M4 Pro): 4-bit **~25-38 tok/s** at 2.3-2.6x,
+8-bit ~24-34 tok/s at 2.8-4.1x (chat is the low end, math/code the high). Extraction output is
+structure-heavy and tends toward the high end.
 
 ## Memory notes
 
-On a 36 GB machine the Q3_K_XL model wires ~17 GB. It runs comfortably; if a long job pages
-heavily, lower `CTX_SIZE` in `.env`. The embedder stays on CPU precisely so Metal's memory is
-reserved for the LLM.
+Qwen3.8-27B-4bit peaks at ~18 GB plus KV cache (~0.086 GB per 1k tokens fp16; only 16 of its 64
+layers hold KV, and `--kv-bits` is rejected for this hybrid target). On a 36 GB machine it runs
+comfortably at the default 32K context. If a long job pages heavily, lower `DSPARK_CTX`.
 
-| Unified memory | Qwen3.6-35B-A3B (Q3, ~17 GB) | Guidance |
+| Unified memory | Qwen3.8-27B-4bit (~18 GB + KV) | Guidance |
 | --- | --- | --- |
 | 16 GB | ✗ won't fit | Not supported; a 7-14B model is the ceiling on this tier. |
-| 24 GB | ⚠ tight | Fits but keep `CTX_SIZE` modest; close Chrome/Docker/IDEs. |
+| 24 GB | ⚠ tight | Fits but keep `DSPARK_CTX` modest; close Chrome/IDEs. |
 | 32-48 GB | ✓ comfortable (**tested on 36 GB**) | Recommended. |
-| 96 GB+ | ✓ plenty | Room for much longer context or larger models. |
+| 48 GB+ | ✓ | Room for the 8-bit build (best ratios, ~29 GB peak) or much longer context. |
 
-## Alternative backend: MLX (faster prefill)
+The embedder stays on CPU precisely so Metal's memory is reserved for the LLM.
 
-`scripts/mac-run.sh` can serve `:8080` with Apple's **mlx-lm** instead of llama.cpp, behind a
-`BACKEND` knob. It's opt-in; the default stays llama.cpp.
+## Alternative backend: llama.cpp (the original Mac path)
+
+The fork's first backend, kept for parity with upstream's GGUF-based flow and its MTP
+speculative decoding:
 
 ```bash
-BACKEND=mlx bash scripts/mac-run.sh      # or set BACKEND=mlx in .env
+BACKEND=llamacpp bash scripts/mac-run.sh      # or set BACKEND=llamacpp in .env
 ```
 
-On an M3 Pro / 36 GB serving the 4-bit MLX model, prefill is dramatically faster (~6x vs llama.cpp)
-with decode at or above the MTP path. Extraction is prefill-heavy (each round re-reads the full
-document), so this is the win that matters for large docs and zips.
+Needs Homebrew's `llama-server` (`brew install llama.cpp`, build >= 9430 for draft-MTP) and the
+Q3_K_XL GGUF under `models/` - `mac-setup.sh` downloads it when `BACKEND=llamacpp`. Key knobs
+(`llama-server` flags mirror upstream's tuned CUDA config with Mac-appropriate values):
+`--flash-attn on` (this build's flag takes `on|off|auto`, not `1`), `-ngl 999` (all layers on
+Metal), `SPEC_ARGS` for draft-MTP, `CACHE_REUSE` for KV reuse across rounds. If your llama.cpp
+build predates 9430, use the non-MTP GGUF (`unsloth/Qwen3.6-35B-A3B-GGUF`) and leave `SPEC_ARGS`
+empty. A GGUF symlinked in from elsewhere works - see `MODEL_FILE` in `.env`.
 
-| Backend | Engine | Model | Prefill | Context ceiling |
-| --- | --- | --- | --- | --- |
-| `llamacpp` *(default)* | llama.cpp (Metal, GGUF) | `models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` | baseline | high (stable) |
-| `mlx` | mlx-lm (`mlx_lm.server`) | `models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit` | ~6x | ~75-85K (auto-capped) |
+## Alternative backend: MLX (legacy)
+
+The intermediate backend before mlx-dspark landed. Serves the old Qwen3.6-35B-A3B model with
+plain mlx-lm - prefill ~6x faster than llama.cpp, but no drafter:
+
+```bash
+BACKEND=mlx bash scripts/mac-run.sh
+```
 
 ### MLX setup (one-time)
 
@@ -180,10 +210,9 @@ VIRTUAL_ENV=$PWD/.venv-mlx uv pip install mlx-lm
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `BACKEND` | `llamacpp` | `llamacpp` or `mlx`. |
 | `MLX_MODEL` | `models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit` | Path to the MLX model dir. |
 | `MLX_CTX_CAP` | `75000` (fp16 KV) / `85000` (4-bit KV) | Max context for MLX; `CTX_SIZE` is auto-capped to this. |
-| `MODEL_NAME` | (auto = `MLX_MODEL` under `mlx`) | Pinned so the app's request `model` field matches the loaded model. |
+| `MODEL_NAME` | (auto = the backend's model) | Pinned so the app's request `model` field matches the loaded model. |
 
 ### MLX caveats
 
@@ -198,6 +227,7 @@ VIRTUAL_ENV=$PWD/.venv-mlx uv pip install mlx-lm
 - **`MODEL_NAME` is pinned to the model path.** `mlx_lm.server` resolves the request's `model`
   field against the loaded model and otherwise tries to fetch it from HuggingFace (a request for
   the friendly label `qwen3.6` -> 404). llama.cpp ignores the label; MLX needs the match, so the
-  script exports `MODEL_NAME=$MLX_MODEL` for this backend (default unchanged for llama.cpp).
+  script exports `MODEL_NAME=$MLX_MODEL` for this backend. The dspark backend pins it to the repo
+  id for the same reason.
 
 Stop the MLX model with `pkill -f mlx_lm.server`.

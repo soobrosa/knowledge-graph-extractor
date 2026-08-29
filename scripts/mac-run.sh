@@ -8,9 +8,15 @@
 # This script only LAUNCHES. Run scripts/mac-setup.sh once first (venv, deps, model);
 # docs/MAC.md has the full reference.
 #
-# BACKEND selects the :8080 server: 'llamacpp' (default, GGUF via llama.cpp) or 'mlx' (mlx-lm,
-# Apple-native, ~6x faster prefill). mlx uses .venv-mlx + models/mlx/... and auto-caps context to
-# MLX_CTX_CAP (fp16-KV OOM headroom). See docs/MAC.md.
+# BACKEND selects the :8080 server:
+#   dspark   (default) mlx-dspark: Qwen3.8-27B with DSpark/DFlash2 speculative decoding
+#            (lossless, up to ~2.6-4x decode vs the same model alone). Serves an
+#            OpenAI-compatible API, drafter + draft cap auto-resolve per machine.
+#   llamacpp GGUF via llama.cpp (Metal, draft-MTP spec decode) - the old default.
+#   mlx      mlx-lm (Apple-native, ~6x faster prefill than llama.cpp on Qwen3.6).
+# mlx uses .venv-mlx + models/mlx/... and auto-caps context to MLX_CTX_CAP (fp16-KV OOM
+# headroom). dspark resolves models from the HF cache (downloads on first use).
+# See docs/MAC.md.
 #
 # llama.cpp flags below mirror the tuned upstream CUDA config (ctx-size, draft-mtp spec decode,
 # cache-reuse) with Mac-appropriate values:
@@ -36,16 +42,48 @@ if [ -z "$JINA_API_KEY" ] || [ "$JINA_API_KEY" = "jina_xxxx" ]; then
   exit 1
 fi
 
-# Inference backend: llamacpp (GGUF via llama.cpp, default) | mlx (mlx-lm, Apple-native).
-BACKEND="${BACKEND:-llamacpp}"
+# Inference backend: dspark (mlx-dspark + Qwen3.8, default) | llamacpp | mlx.
+BACKEND="${BACKEND:-dspark}"
 
 [ -x "$ROOT/.venv/bin/python" ] || { echo "ERROR: .venv missing. See docs/MAC.md (uv venv + uv pip install)." >&2; exit 1; }
+
+# --- DSpark backend knobs (only used when BACKEND=dspark) ---------------------
+# mlx-dspark serve is an OpenAI-compatible server on :8080. --mode auto resolves the
+# measured-best drafter for the target (for Qwen3.8-27B that's the DFlash2 drafter);
+# the draft cap is calibrated against THIS machine on first run and cached.
+DSPARK_BIN="${MLX_DSPARK_BIN:-$(command -v mlx-dspark || true)}"
+DSPARK_MODEL="${DSPARK_MODEL:-mlx-community/Qwen3.8-27B-4bit}"   # ~18GB peak; 8bit (~29GB) needs 48GB+
+DSPARK_MODE="${DSPARK_MODE:-auto}"                               # auto|dspark|dflash|lookup|baseline
+# Target KV quantization: 0 = off (default). Qwen3.8-27B is a HYBRID linear-attention target
+# (only 16 of 64 layers hold a KV cache) and mlx-dspark REJECTS --kv-bits for hybrids, so the
+# default must stay off; 4/8 are for pure-attention targets only.
+DSPARK_KV_BITS="${DSPARK_KV_BITS:-0}"
+DSPARK_CTX="${DSPARK_CTX:-32768}"                                # server-side context window
+# Extraction wants facts, not reasoning: --no-thinking by default (the model still answers
+# fine; thinking mode costs tokens on every round). ENABLE_THINKING=1 in .env to allow it.
+ENABLE_THINKING="${ENABLE_THINKING:-0}"
+
 case "$BACKEND" in
+  dspark)
+    [ -n "$DSPARK_BIN" ] && [ -x "$DSPARK_BIN" ] || [ -x "$ROOT/.venv-dspark/bin/mlx-dspark" ] || {
+      echo "ERROR: mlx-dspark not found. Install it:  uv tool install mlx-dspark" >&2
+      echo "       (or provision it with: bash scripts/mac-setup.sh --dspark)" >&2
+      exit 1
+    }
+    [ -n "$DSPARK_BIN" ] && [ -x "$DSPARK_BIN" ] || DSPARK_BIN="$ROOT/.venv-dspark/bin/mlx-dspark"
+    case "$DSPARK_MODEL" in
+      /*) [ -e "$DSPARK_MODEL" ] || { echo "ERROR: model path not found: $DSPARK_MODEL" >&2; exit 1; } ;;
+      *)  : ;;  # HF repo id: mlx-dspark pulls it into the HF cache on first serve
+    esac
+    # The app sends the loaded model's id in the `model` field; llama.cpp ignores it, but pin
+    # MODEL_NAME to the real id so any strict server (mlx-lm, mlx-dspark /v1/models) matches.
+    export MODEL_NAME="${MODEL_NAME:-$DSPARK_MODEL}"
+    ;;
   llamacpp)
     command -v llama-server >/dev/null || { echo "ERROR: llama-server not found. Install: brew install llama.cpp" >&2; exit 1; } ;;
   mlx)
     [ -x "$ROOT/.venv-mlx/bin/mlx_lm.server" ] || { echo "ERROR: .venv-mlx is missing mlx-lm. Create it: uv venv .venv-mlx && VIRTUAL_ENV=\$PWD/.venv-mlx uv pip install mlx-lm  (see docs/MAC.md)" >&2; exit 1; } ;;
-  *) echo "ERROR: BACKEND must be 'llamacpp' or 'mlx' (got '$BACKEND')" >&2; exit 1 ;;
+  *) echo "ERROR: BACKEND must be 'dspark', 'llamacpp' or 'mlx' (got '$BACKEND')" >&2; exit 1 ;;
 esac
 
 MODEL_FILE="${MODEL_FILE:-Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf}"
@@ -89,26 +127,49 @@ if [ "$BACKEND" = "mlx" ]; then
     echo "NOTE: BACKEND=mlx caps CTX_SIZE $CTX_SIZE -> $MLX_CTX_CAP"
     CTX_SIZE="$MLX_CTX_CAP"
   fi
-else
+elif [ "$BACKEND" = "llamacpp" ]; then
   [ -f "$MODEL_PATH" ] || { echo "ERROR: model not found: $MODEL_PATH  (see docs/MAC.md to download the GGUF)" >&2; exit 1; }
 fi
 
 mkdir -p logs "${JOBS_DIR:-./data/jobs}"
 
 # Wait for the :8080 server to answer /health, or tail its log and bail.
+# secs must cover a cold first-ever start: model load, drafter download (~GBs),
+# and one-time machine calibration.
 wait_for_server() {
-  local label="$1" logf="$2"
+  local label="$1" logf="$2" secs="${3:-240}"
+  local ticks=$(( secs / 2 ))
   echo -n "waiting for $label"
-  for i in $(seq 1 120); do
+  for i in $(seq 1 "$ticks"); do
     if curl -fsS "http://127.0.0.1:8080/health" >/dev/null 2>&1; then echo " ready"; return 0; fi
     echo -n "."; sleep 2
-    [ "$i" = 120 ] && { echo " TIMEOUT"; tail -30 "$logf"; exit 1; }
+    if [ "$i" = "$ticks" ]; then echo " TIMEOUT (${secs}s)"; tail -30 "$logf"; exit 1; fi
   done
 }
 
 # --- 1. inference server (:8080) ----------------------------------------------
 if curl -fsS "http://127.0.0.1:8080/health" >/dev/null 2>&1; then
   echo "inference server already up on :8080"
+elif [ "$BACKEND" = "dspark" ]; then
+  THINK_ARGS=""
+  [ "$ENABLE_THINKING" = "1" ] || THINK_ARGS="--no-thinking"
+  KV_ARGS=()
+  [ "$DSPARK_KV_BITS" != "0" ] && KV_ARGS=(--kv-bits "$DSPARK_KV_BITS")
+  echo "=== starting mlx-dspark serve ($DSPARK_MODEL, mode=$DSPARK_MODE) ==="
+  echo "    first run downloads the model + drafter if not cached, then calibrates"
+  echo "    this machine's draft cap (~5s); a warm load takes ~30-60s"
+  # shellcheck disable=SC2086
+  nohup "$DSPARK_BIN" serve \
+    --model "$DSPARK_MODEL" \
+    --mode "$DSPARK_MODE" \
+    --host 127.0.0.1 --port 8080 \
+    --context-window "$DSPARK_CTX" \
+    --default-max-tokens 8192 \
+    ${KV_ARGS[@]+"${KV_ARGS[@]}"} \
+    $THINK_ARGS \
+    > "$ROOT/logs/dspark.log" 2>&1 &
+  echo "mlx-dspark PID: $!  (logs: logs/dspark.log)"
+  wait_for_server "mlx-dspark" "$ROOT/logs/dspark.log" 900
 elif [ "$BACKEND" = "mlx" ]; then
   echo "=== starting mlx_lm.server (Metal) - first run ~30-60s ==="
   nohup "$ROOT/.venv-mlx/bin/mlx_lm.server" \
@@ -148,7 +209,12 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 echo "=== starting Knowledge Graph Extractor app on :3000 ==="
 echo "    web UI:     http://localhost:3000/"
 echo "    backend:    $BACKEND"
-if [ "$BACKEND" = "mlx" ]; then
+if [ "$BACKEND" = "dspark" ]; then
+  echo "    LLAMA_URL:  $LLAMA_URL    ctx=$DSPARK_CTX    model=$DSPARK_MODEL"
+  [ "$DSPARK_KV_BITS" = "0" ] || echo "    kv:         ${DSPARK_KV_BITS}-bit (older mlx-dspark rejects --kv-bits on hybrid targets)"
+  echo "    spec:       mode=$DSPARK_MODE (drafter + draft cap auto-resolved, lossless)"
+  [ "$ENABLE_THINKING" = "1" ] || echo "    thinking:   off (ENABLE_THINKING=1 to enable)"
+elif [ "$BACKEND" = "mlx" ]; then
   echo "    LLAMA_URL:  $LLAMA_URL    ctx=$CTX_SIZE (cap $MLX_CTX_CAP)    model=$MLX_MODEL"
   if [ ${#MLX_KV_ARGS[@]} -gt 0 ]; then
     echo "    note:       ${MLX_KV_BITS}-bit KV (group $MLX_KV_GROUP_SIZE, mlx-lm#1353)"

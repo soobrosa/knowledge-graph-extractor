@@ -1,15 +1,19 @@
 # Knowledge Graph Extractor — Apple Silicon
 
 Turn any document, URL, or a zip of files into an interactive knowledge graph,
-using a self-hosted LLM (Qwen3.6-35B-A3B-MTP) running **natively on an Apple
-Silicon Mac over Metal — no Docker, no NVIDIA GPU, nothing leaving the machine.**
+using a self-hosted LLM (Qwen3.8-27B, DSpark-accelerated) running **natively on
+an Apple Silicon Mac over Metal — no Docker, no NVIDIA GPU, nothing leaving the
+machine.**
 
 > **Mac-only fork** of [hanxiao/knowledge-graph-extractor](https://github.com/hanxiao/knowledge-graph-extractor),
 > which targets a single NVIDIA L4 via Docker. This fork drops the CUDA/Docker
-> path entirely and replaces it with `llama.cpp` on Metal plus an optional
-> [MLX](https://github.com/ml-explore/mlx-lm) backend (~6x faster prefill).
-> Extraction, dedup, scheduler and UI are upstream's and still track it; the Mac
-> support is offered back in
+> path entirely and serves Qwen3.8-27B through
+> [mlx-dspark](https://github.com/ARahim3/mlx-dspark) — DeepSeek's DSpark and
+> z-lab's DFlash speculative decoding, native on MLX, **lossless and up to
+> ~2.6-4x faster decode** than the same model alone. `llama.cpp` (Metal) and
+> `mlx-lm` remain as alternative backends for the previous Qwen3.6-35B-A3B
+> model. Extraction, dedup, scheduler and UI are upstream's and still track it;
+> the Mac support is offered back in
 > [PR #15](https://github.com/hanxiao/knowledge-graph-extractor/pull/15).
 > Need the NVIDIA path? Use upstream.
 
@@ -26,39 +30,41 @@ file. Facts stream into a force-directed graph; hover an edge for the full card.
 | | |
 |---|---|
 | Machine | Apple Silicon (M-series). **32GB+ unified memory recommended**; tested on M3 Pro / 36GB |
-| Tools | `brew install llama.cpp` (build ≥ 9430 for MTP spec decoding), [`uv`](https://astral.sh/uv) |
-| Disk | ~17GB for the Q3_K_XL GGUF |
+| Tools | [`uv`](https://astral.sh/uv); `mlx-dspark` (installed by setup, or `uv tool install mlx-dspark`) |
+| Disk | ~16GB for Qwen3.8-27B-4bit, plus a few GB for the drafter |
 | Keys | A free [Jina API key](https://jina.ai/api-key), only needed for URL inputs |
 
 A 16GB machine won't fit this model; see the [memory table](docs/MAC.md#memory-notes).
+The 8-bit Qwen3.8 build (higher spec-decode ratios, ~29GB peak) needs 48GB+.
 
 ## Quickstart
 
 ```bash
-brew install llama.cpp
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 git clone https://github.com/soobrosa/knowledge-graph-extractor.git
 cd knowledge-graph-extractor
 
-bash scripts/mac-setup.sh     # machine checks, .venv + deps, .env, model download (~17GB)
-bash scripts/mac-run.sh       # llama-server on :8080 (Metal), then the app on :3000
+bash scripts/mac-setup.sh     # machine checks, .venv + deps, .env, mlx-dspark, model download
+bash scripts/mac-run.sh       # mlx-dspark on :8080 (Metal), then the app on :3000
 ```
 
 Then open **http://localhost:3000/**.
 
 `mac-setup.sh` is idempotent: it verifies the machine and host tools, warns about
-insufficient unified memory or a llama.cpp build too old for `draft-mtp`, creates
-`.venv` from [`requirements.txt`](requirements.txt), seeds `.env`, and resumes the
-model download if interrupted. Re-run it freely. Useful flags:
+insufficient unified memory, creates `.venv` from [`requirements.txt`](requirements.txt),
+seeds `.env`, installs mlx-dspark if it's missing, and pulls Qwen3.8-27B-4bit into the
+Hugging Face cache (resumable). Re-run it freely. Useful flags:
 
 ```bash
-bash scripts/mac-setup.sh --skip-model   # set up everything but the 17GB download
-bash scripts/mac-setup.sh --mlx          # also provision the MLX backend
+bash scripts/mac-setup.sh --skip-model   # set up everything but the model download
+bash scripts/mac-setup.sh --dspark       # force mlx-dspark into a project .venv-dspark
+bash scripts/mac-setup.sh --mlx          # also provision the legacy mlx-lm backend
 ```
 
 Add your Jina key to `.env` (`JINA_API_KEY=`) before running; `mac-run.sh` refuses
-to start without one. Stop the app with `Ctrl+C`, the model with `pkill -f llama-server`.
+to start without one. Stop the app with `Ctrl+C`, the model with
+`pkill -f mlx-dspark`.
 
 ## How it works
 
@@ -85,26 +91,25 @@ restarts.
 
 ## Backends
 
-Both serve an OpenAI-compatible API on `:8080`; the app only ever talks to
+All three serve an OpenAI-compatible API on `:8080`; the app only ever talks to
 `LLAMA_URL`, so no application logic differs between them.
 
-| `BACKEND` | Engine | Model | Prefill | Context ceiling |
+| `BACKEND` | Engine | Model | Decode | Notes |
 |---|---|---|---|---|
-| `llamacpp` *(default)* | llama.cpp (Metal, GGUF) | `models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` | baseline | high (stable) |
-| `mlx` | mlx-lm (`mlx_lm.server`) | `models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit` | ~6x | ~75-85K (auto-capped) |
+| `dspark` *(default)* | [mlx-dspark](https://github.com/ARahim3/mlx-dspark) | `mlx-community/Qwen3.8-27B-4bit` (~18GB) | ~25-38 tok/s, **2.6-4x vs the same model alone** (DFlash2 drafter, `--mode auto`) | lossless spec decode; draft cap auto-calibrated per Mac; CPU co-prefill + prefix caching |
+| `llamacpp` | llama.cpp (Metal, GGUF) | `models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` | draft-MTP spec decode | the original Mac path |
+| `mlx` | mlx-lm (`mlx_lm.server`) | `models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit` | ~6x llama.cpp prefill | legacy alternative |
 
-Extraction is prefill-heavy (each round re-reads the whole document), so MLX is
-the win that matters on large docs and zips:
+The default is one command with no drafter flags: `--mode auto` resolves the
+measured-best drafter for the target (for Qwen3.8-27B that's the
+[DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) head), and the
+draft cap is calibrated against *your* machine on first run. Thinking mode is
+off by default — extraction wants facts, not reasoning; `ENABLE_THINKING=1`
+turns it back on.
 
 ```bash
-BACKEND=mlx bash scripts/mac-run.sh
+BACKEND=llamacpp bash scripts/mac-run.sh   # or BACKEND=mlx
 ```
-
-MLX needs its own venv (`--mlx` above) because mlx-lm bumps `transformers` and
-breaks the dedup embedder if installed alongside it. Context is auto-capped
-because released `mlx_lm.server` has no KV-quantization flag; the launcher
-detects `--kv-bits` and raises the cap when a build finally ships it. Details and
-caveats: [docs/MAC.md](docs/MAC.md#alternative-backend-mlx-faster-prefill).
 
 ## Configuration
 
@@ -113,12 +118,15 @@ Everything is env, read from `.env` by both scripts. Defaults live in
 
 | Var | Default | Why |
 |---|---|---|
-| `BACKEND` | `llamacpp` | `llamacpp` or `mlx` |
-| `MODEL_FILE` | `Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` | GGUF under `models/` (a symlink to one elsewhere works) |
-| `CTX_SIZE` | `16384` | Input capacity vs unified memory; auto-capped under `mlx` |
-| `SPEC_ARGS` | `--spec-type draft-mtp ...` | MTP speculative decoding; set empty to disable on older llama.cpp |
-| `NGL` | `999` | All layers on Metal (unified memory, no spill tradeoff) |
-| `CACHE_REUSE` | `256` | KV cache reuse across rounds on the same doc |
+| `BACKEND` | `dspark` | `dspark`, `llamacpp`, or `mlx` |
+| `DSPARK_MODEL` | `mlx-community/Qwen3.8-27B-4bit` | HF repo or local path; drafter auto-resolves |
+| `DSPARK_MODE` | `auto` | `auto` / `dspark` / `dflash` / `lookup` / `baseline` |
+| `DSPARK_KV_BITS` | `0` | Target KV quantization; **must stay `0` for Qwen3.8-27B** (hybrid linear-attention targets reject `--kv-bits`) |
+| `DSPARK_CTX` | `32768` | Server-side context window |
+| `ENABLE_THINKING` | off | `1` lets Qwen3.8 reason before answering (slower) |
+| `MODEL_FILE` | `Qwen3.6-...gguf` | GGUF under `models/` (llamacpp backend only; symlinks work) |
+| `CTX_SIZE` | `16384` | App-side input chunk budget (llamacpp/`mlx` backends) |
+| `SPEC_ARGS` | `--spec-type draft-mtp ...` | llama.cpp MTP spec decode; set empty to disable |
 | `LLAMA_URL` | `http://127.0.0.1:8080` | Where the app looks for the model server |
 
 UI parameters: rounds per doc, dedup model (on/off), dedup field, dedup threshold.
@@ -130,7 +138,7 @@ app.py               FastAPI app: extraction + UI + API
 jobs.py              single-slot job scheduler (queue/preempt/backfill/persist)
 requirements.txt     app dependencies (installed into .venv)
 scripts/mac-setup.sh one-shot setup: checks, venv + deps, .env, model download
-scripts/mac-run.sh   launcher: llama.cpp (Metal) or MLX on :8080, then the app
+scripts/mac-run.sh   launcher: mlx-dspark (default), llama.cpp, or mlx-lm on :8080
 docs/MAC.md          full Mac reference: memory tiers, backends, env knobs, caveats
 autoresearch/        upstream's quantization/decoding benchmarks (measured on an L4)
 data/                persisted jobs (gitignored)
