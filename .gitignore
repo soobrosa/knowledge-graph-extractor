@@ -3,3 +3,6 @@ models/
 __pycache__/
 *.pyc
 data/
+.venv/
+.venv-mlx/
+logs/

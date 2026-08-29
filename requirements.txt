@@ -1,0 +1,23 @@
+# Knowledge Graph Extractor - app dependencies (Apple Silicon / native macOS).
+#
+# Installed into .venv by scripts/mac-setup.sh. torch resolves to the
+# Apple-Silicon (MPS/CPU) wheel automatically on darwin-arm64; the dedup
+# embedder is pinned to CPU in app.py so Metal's unified memory stays
+# reserved for the LLM.
+#
+# Unpinned by design, matching upstream. If a future release breaks the
+# embedder, pin the offending package here and note why.
+
+fastapi
+uvicorn
+httpx
+numpy
+python-multipart
+pypdf
+sentence-transformers
+peft
+einops
+torch
+
+# Model download (scripts/mac-setup.sh, docs/MAC.md).
+huggingface-hub
