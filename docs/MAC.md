@@ -123,6 +123,16 @@ Open **http://localhost:3000/**.
 
 Stop the app with `Ctrl+C`; stop the model with `pkill -f mlx-dspark`.
 
+## Smoke test
+
+`scripts/smoke.sh` verifies the live stack end to end in ~1 minute: `/health`,
+a real completion, an attached drafter (a `mode=lookup` result is reported as a
+failure - that's the silent degradation an old mlx-dspark causes), the UI, and
+a real extraction job whose facts must parse with subject/predicate/object set.
+It exits 0/1 and leaves its test job in the job list (no delete API yet). Run
+it standalone, or let `mac-run.sh --smoke` check the server before starting the
+app.
+
 ### What mlx-dspark buys
 
 - **Lossless speculation.** The target verifies every drafted token, so output is identical to

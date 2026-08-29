@@ -66,6 +66,20 @@ Add your Jina key to `.env` (`JINA_API_KEY=`) before running; `mac-run.sh` refus
 to start without one. Stop the app with `Ctrl+C`, the model with
 `pkill -f mlx-dspark`.
 
+## Smoke test
+
+The repo ships a live smoke test — server health, a real completion, proof a
+drafter is attached (not silent lookup-mode degradation), and a real extraction
+job checked for well-formed facts:
+
+```bash
+bash scripts/smoke.sh          # full pass: server :8080 + app :3000 (~1 min)
+bash scripts/mac-run.sh --smoke  # or self-check the server at launch
+```
+
+`SMOKE PASS` means the backend actually extracts facts, not just that ports
+answer. Exit code is 0/1, so it's cron/CI-able.
+
 ## How it works
 
 1. **Input** — paste text, a URL (fetched to markdown via Jina Reader), or a

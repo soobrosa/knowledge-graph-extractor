@@ -29,6 +29,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
+# Flags: --smoke  run scripts/smoke.sh (server checks) after the server is up,
+#                 before starting the app; abort if it fails. SMOKE=1 also works.
+RUN_SMOKE="${SMOKE:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --smoke) RUN_SMOKE=1 ;;
+    -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "ERROR: unknown flag '$arg' (try --help)" >&2; exit 1 ;;
+  esac
+done
+
 set -a
 if [ -f .env ]; then
   # shellcheck disable=SC1091  # .env is user-created, not in the repo
@@ -199,6 +210,14 @@ else
     > "$ROOT/logs/llama.log" 2>&1 &
   echo "llama-server PID: $!  (logs: logs/llama.log)"
   wait_for_server "llama-server" "$ROOT/logs/llama.log"
+fi
+
+# --- 1b. optional smoke check (server-side) -----------------------------------
+if [ "$RUN_SMOKE" = "1" ]; then
+  echo "=== smoke-checking the inference server (scripts/smoke.sh) ==="
+  # Server checks only - the app isn't up yet. Run `bash scripts/smoke.sh` later
+  # for the full end-to-end pass including a real extraction job.
+  bash "$ROOT/scripts/smoke.sh" --skip-app
 fi
 
 # --- 2. FastAPI app (:3000) ---------------------------------------------------
