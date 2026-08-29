@@ -1,25 +1,30 @@
 # Run on Apple Silicon (Mac, Metal)
 
-The Knowledge Graph Extractor runs natively on an Apple Silicon Mac with **no Docker and no NVIDIA
-GPU**. Homebrew's `llama.cpp` `llama-server` serves the model on **Metal**, and the FastAPI app +
-the `jina-embeddings-v5-text-nano` dedup embedder run in a local `uv` virtualenv. No application
-logic changes are needed: the model is decoupled behind the OpenAI-compatible `LLAMA_URL`, so the
-only Mac-specific concerns are which GGUF to use, the `llama-server` flags, and installing the deps
-the Docker image normally bundles.
+This is the Mac-only fork's full reference. The extractor runs natively on an Apple Silicon Mac with
+**no Docker and no NVIDIA GPU**. Homebrew's `llama.cpp` `llama-server` serves the model on **Metal**,
+and the FastAPI app + the `jina-embeddings-v5-text-nano` dedup embedder run in a local `uv`
+virtualenv. No application logic changes are needed: the model is decoupled behind the
+OpenAI-compatible `LLAMA_URL`, so the only Mac-specific concerns are which GGUF to use, the
+`llama-server` flags, and installing the deps upstream's Docker image bundles.
 
 Tested on an **M3 Pro / 36 GB**, macOS, `llama.cpp` build 9430 (Homebrew). At least **32 GB** of
 unified memory is recommended - the Q3_K_XL model wires ~17 GB.
 
-## What's different from the NVIDIA/Docker path
+## What's different from upstream (NVIDIA / Docker)
 
-| Area | NVIDIA / Docker | Apple Silicon | Why |
+Upstream [hanxiao/knowledge-graph-extractor](https://github.com/hanxiao/knowledge-graph-extractor)
+targets a single NVIDIA L4 through `docker compose`. This fork removes that path entirely; the table
+records what the Mac path does instead, and why.
+
+| Area | Upstream (NVIDIA / Docker) | This fork (Apple Silicon) | Why |
 | --- | --- | --- | --- |
 | Serving | `llama.cpp:server-cuda` container | Homebrew `llama-server` (Metal) | No CUDA / `nvidia-container-toolkit` on macOS. |
 | GPU offload | implicit (CUDA) | `-ngl 999` (`NGL` env) | Unified memory: put all layers on Metal. |
 | Flash attention | `--flash-attn 1` | `--flash-attn on` | This build's flag takes `on\|off\|auto`, not `1`. |
 | Speculative decode | `--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.1` | Same (`SPEC_ARGS`) | MTP works on `llama.cpp` >= 9430. Leave `SPEC_ARGS` empty to disable. |
 | App + embedder | Docker container | `python app.py` in a `uv` venv; embedder on CPU | No GPU passthrough into Docker on macOS; CPU keeps Metal free for the LLM. |
-| torch | from the CPU wheel in the image | `uv pip install torch` (MPS/CPU build) | Installed into the local venv instead. |
+| torch | CPU wheel baked into the image | `requirements.txt` into `.venv` (MPS/CPU build) | Installed locally; no image to build. |
+| Setup | `scripts/setup.sh` (GCP L4) | `scripts/mac-setup.sh` | Machine checks, venv, deps, model download. |
 
 ## Prerequisites
 
@@ -29,23 +34,44 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # uv (Python env)
 uv --version
 ```
 
-You also need a free **Jina API key** (https://jina.ai/api-key) and, recommended, a free
-**Hugging Face read token** (https://huggingface.co/settings/tokens) for a fast, stable model
-download.
+You also need a free **Jina API key** (https://jina.ai/api-key, only used for URL inputs) and,
+recommended, a free **Hugging Face read token** (https://huggingface.co/settings/tokens) for a
+fast, stable model download.
 
-## 1. Install the Python deps
+## Setup (scripted)
 
-The Dockerfile's dependency set, into a local venv. `torch` pulls the Apple-Silicon (MPS/CPU) build.
+```bash
+bash scripts/mac-setup.sh
+```
+
+One idempotent pass over everything in the manual section below: verifies arm64 and unified memory,
+checks `llama-server` and `uv`, warns if the llama.cpp build predates `draft-mtp`, creates `.venv`
+from `requirements.txt`, seeds `.env` from `.env.example`, and downloads the GGUF (resumable).
+Re-run it after a failure and it resumes rather than redoing.
+
+```bash
+HF_TOKEN=hf_your_token bash scripts/mac-setup.sh   # avoids the anonymous rate limit
+bash scripts/mac-setup.sh --skip-model             # everything except the 17 GB download
+bash scripts/mac-setup.sh --mlx                    # also provision the MLX backend
+```
+
+Then put a real key in `.env` (`JINA_API_KEY=...`) - `mac-run.sh` refuses to start without one -
+and skip to [Run](#run).
+
+## Setup (manual)
+
+Equivalent to the script, if you'd rather do it by hand.
+
+### 1. Install the Python deps
+
+`torch` pulls the Apple-Silicon (MPS/CPU) build.
 
 ```bash
 uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python \
-  fastapi uvicorn httpx numpy python-multipart pypdf \
-  sentence-transformers peft einops \
-  torch huggingface-hub
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-## 2. Download the model (~17 GB)
+### 2. Download the model (~17 GB)
 
 ```bash
 mkdir -p models
@@ -59,7 +85,14 @@ The `HF_TOKEN=` prefix is optional but avoids the unauthenticated rate limit. If
 is older than build 9430 (check `llama-server --help` for `draft-mtp`), use the **non-MTP** GGUF
 (`unsloth/Qwen3.6-35B-A3B-GGUF`) instead and leave `SPEC_ARGS` empty.
 
-## 3. Set your key
+A model living elsewhere on disk works too - symlink it in and both scripts find it:
+
+```bash
+ln -s /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf models/
+echo 'MODEL_FILE=Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf' >> .env
+```
+
+### 3. Set your key
 
 ```bash
 cp .env.example .env
@@ -70,13 +103,15 @@ Mac defaults are baked into `scripts/mac-run.sh`; override any in `.env`:
 
 ```bash
 MODEL_FILE=Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
-CTX_SIZE=16384            # matches the Docker default; raise if you have headroom
+CTX_SIZE=16384            # raise if you have headroom
 SPEC_ARGS='--spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.1'
 LLAMA_URL=http://127.0.0.1:8080
 JOBS_DIR=./data/jobs
 ```
 
-## 4. Run
+Both scripts source `.env` before applying their defaults, so anything pinned there wins.
+
+## Run
 
 ```bash
 bash scripts/mac-run.sh
@@ -121,13 +156,22 @@ document), so this is the win that matters for large docs and zips.
 ### MLX setup (one-time)
 
 mlx-lm must live in its **own** venv - installing it into the app `.venv` bumps `transformers` and
-can break the embedder.
+can break the embedder. `mac-setup.sh --mlx` does this for you:
+
+```bash
+bash scripts/mac-setup.sh --mlx                    # creates .venv-mlx, installs mlx-lm
+MLX_HF_REPO=<org/repo> bash scripts/mac-setup.sh --mlx --skip-model   # + fetch a 4-bit MLX build
+```
+
+Without `MLX_HF_REPO` it sets up the venv and then tells you how to supply the model, since there's
+no single canonical 4-bit MLX repo for this one. By hand:
 
 ```bash
 uv venv .venv-mlx
 VIRTUAL_ENV=$PWD/.venv-mlx uv pip install mlx-lm
-# Download or convert a 4-bit MLX build into models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit
-# (e.g. mlx_lm.convert, or pull a pre-quantized 4-bit MLX repo).
+# Download or convert a 4-bit MLX build into models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit:
+.venv-mlx/bin/mlx_lm.convert --hf-path <org/repo> -q --q-bits 4 \
+  --mlx-path models/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit
 ```
 
 `mac-run.sh` checks both the venv and the model exist before starting and errors with the fix if not.
